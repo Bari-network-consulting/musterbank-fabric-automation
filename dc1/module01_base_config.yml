@@ -1,0 +1,93 @@
+---
+- name: "DC1 Frankfurt — Base Config: NX-OS Fabric"
+  hosts: dc1_fabric
+  gather_facts: false
+
+  tasks:
+
+    - name: Configure hostname
+      cisco.nxos.nxos_system:
+        hostname: "{{ inventory_hostname }}"
+        state: present
+
+    - name: Configure mgmt0 IPv4 address
+      cisco.nxos.nxos_l3_interfaces:
+        config:
+          - name: mgmt0
+            ipv4:
+              - address: "{{ ansible_host }}/24"
+        state: merged
+
+    - name: Configure default route via management VRF
+      cisco.nxos.nxos_static_routes:
+        config:
+          - vrf: management
+            address_families:
+              - afi: ipv4
+                routes:
+                  - dest: "0.0.0.0/0"
+                    next_hops:
+                      - forward_router_address: "192.168.1.1"
+                        interface: mgmt0
+        state: merged
+
+    - name: Set boot image
+      cisco.nxos.nxos_command:
+        commands:
+          - "boot nxos bootflash:/{{ nxos_image }}"
+
+    - name: Save configuration
+      cisco.nxos.nxos_command:
+        commands:
+          - command: "copy running-config startup-config"
+            prompt: "Copy complete"
+            answer: ""
+
+
+- name: "DC1 Frankfurt — Base Config: IOS Servers"
+  hosts: dc1_ios
+  gather_facts: false
+
+  vars:
+    mgmt_gateway: "192.168.1.1"
+    domain_name: "demolab.musterbank.com"
+
+  tasks:
+
+    - name: Configure hostname
+      cisco.ios.ios_system:
+        hostname: "{{ inventory_hostname }}"
+        domain_name: "{{ domain_name }}"
+        state: present
+
+    - name: Configure Management VRF
+      cisco.ios.ios_vrf:
+        vrfs:
+          - name: Management
+            rd: "65001:1"
+        state: present
+
+    - name: Configure management interface (Ethernet0/3)
+      cisco.ios.ios_l3_interfaces:
+        config:
+          - name: Ethernet0/3
+            ipv4:
+              - address: "{{ ansible_host }}/24"
+        state: merged
+
+    - name: Configure static route via Management VRF
+      cisco.ios.ios_static_routes:
+        config:
+          - vrf: Management
+            address_families:
+              - afi: ipv4
+                routes:
+                  - dest: "192.168.1.0/24"
+                    next_hops:
+                      - forward_router_address: "{{ mgmt_gateway }}"
+        state: merged
+
+    - name: Save configuration
+      cisco.ios.ios_command:
+        commands:
+          - write memory

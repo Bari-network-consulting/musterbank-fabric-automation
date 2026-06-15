@@ -5,9 +5,14 @@
 
   vars:
     backup_root: "/opt/backups/musterbank/dc2"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
+
+    - name: Set backup timestamp (once, consistent across all tasks)
+      set_fact:
+        backup_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+      run_once: true
+      delegate_to: localhost
 
     - name: Create backup directory
       file:
@@ -33,13 +38,13 @@
     - name: Write timestamped backup
       copy:
         content: "{{ running_config.stdout[0] }}"
-        dest: "{{ backup_root }}/{{ inventory_hostname }}/{{ timestamp }}.cfg"
+        dest: "{{ backup_root }}/{{ inventory_hostname }}/{{ backup_timestamp }}.cfg"
         mode: '0644'
       delegate_to: localhost
 
     - name: Update latest.cfg symlink
       file:
-        src: "{{ backup_root }}/{{ inventory_hostname }}/{{ timestamp }}.cfg"
+        src: "{{ backup_root }}/{{ inventory_hostname }}/{{ backup_timestamp }}.cfg"
         dest: "{{ backup_root }}/{{ inventory_hostname }}/latest.cfg"
         state: link
         force: true
@@ -47,7 +52,7 @@
 
     - name: Summary
       debug:
-        msg: "{{ inventory_hostname }} — saved + backed up to {{ backup_root }}/{{ inventory_hostname }}/{{ timestamp }}.cfg"
+        msg: "{{ inventory_hostname }} — saved + backed up to {{ backup_root }}/{{ inventory_hostname }}/{{ backup_timestamp }}.cfg"
 
 
 - name: "DC2 Nürnberg — Save & Backup IOS Servers"
@@ -56,9 +61,14 @@
 
   vars:
     backup_root: "/opt/backups/musterbank/dc2/servers"
-    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
 
   tasks:
+
+    - name: Set backup timestamp (once, consistent across all tasks)
+      set_fact:
+        backup_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+      run_once: true
+      delegate_to: localhost
 
     - name: Create backup directory
       file:
@@ -82,13 +92,13 @@
     - name: Write timestamped backup
       copy:
         content: "{{ running_config.stdout[0] }}"
-        dest: "{{ backup_root }}/{{ inventory_hostname }}/{{ timestamp }}.cfg"
+        dest: "{{ backup_root }}/{{ inventory_hostname }}/{{ backup_timestamp }}.cfg"
         mode: '0644'
       delegate_to: localhost
 
     - name: Update latest.cfg symlink
       file:
-        src: "{{ backup_root }}/{{ inventory_hostname }}/{{ timestamp }}.cfg"
+        src: "{{ backup_root }}/{{ inventory_hostname }}/{{ backup_timestamp }}.cfg"
         dest: "{{ backup_root }}/{{ inventory_hostname }}/latest.cfg"
         state: link
         force: true
@@ -96,4 +106,4 @@
 
     - name: Summary
       debug:
-        msg: "{{ inventory_hostname }} — NVRAM saved + backed up to {{ backup_root }}/{{ inventory_hostname }}/{{ timestamp }}.cfg"
+        msg: "{{ inventory_hostname }} — NVRAM saved + backed up to {{ backup_root }}/{{ inventory_hostname }}/{{ backup_timestamp }}.cfg"

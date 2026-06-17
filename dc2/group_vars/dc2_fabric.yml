@@ -5,10 +5,12 @@ ansible_user: admin
 ansible_password: Admin1234!
 ansible_become: false
 
+# BGP / OSPF (Phase 1 original HLD design — superseded by IS-IS below for underlay)
 bgp_as: 65002
 ospf_process: 1
 ospf_area: "0.0.0.0"
 
+# Tenants (same design as DC1, different BGP AS)
 tenants:
   - name: TENANT-A
     vrf: TENANT-A
@@ -42,10 +44,22 @@ tenants:
 
 anycast_gw_mac: "0001.0001.0001"
 
+# Route reflectors (Spines)
 route_reflectors:
-  - ip: "10.2.0.1"
+  - ip: "10.2.0.11"
     description: "N-SPINE-01-RR"
-  - ip: "10.2.0.2"
+  - ip: "10.2.0.12"
     description: "N-SPINE-02-RR"
 
 nxos_image: "nxos64-cs.10.6.1.F.bin"
+
+# =============================================================================
+# IS-IS Underlay process settings (Phase 1)
+# Replaces the OSPF underlay originally planned above (ospf_process/ospf_area).
+# Separate IS-IS area from DC1 (49.0001) since DC1 and DC2 are independent
+# fabrics, joined only later via DCI (MP-BGP EVPN), not via shared underlay.
+# Per-device addressing (loopback, NET, link IPs) lives in host_vars/.
+# =============================================================================
+isis_process_tag: "UNDERLAY"
+isis_area: "49.0002"
+isis_level: "level-2"

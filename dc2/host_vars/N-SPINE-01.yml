@@ -1,0 +1,35 @@
+---
+# =============================================================================
+# N-SPINE-01 — IS-IS Underlay addressing (Phase 1, DC2)
+# Verified manually via CLI, codified here for module02.
+# =============================================================================
+
+loopback0_ip: "10.2.0.11"
+isis_net: "49.0002.0000.0000.0011.00"
+
+isis_links:
+  - interface: Ethernet1/1
+    ip: "172.16.2.0"
+    prefix: 31
+    peer: N-LEAF-01
+    peer_interface: Ethernet1/1
+  - interface: Ethernet1/2
+    ip: "172.16.2.2"
+    prefix: 31
+    peer: N-LEAF-02
+    peer_interface: Ethernet1/1
+  - interface: Ethernet1/3
+    ip: "172.16.2.4"
+    prefix: 31
+    peer: N-LEAF-03
+    peer_interface: Ethernet1/1
+  - interface: Ethernet1/4
+    ip: "172.16.2.6"
+    prefix: 31
+    peer: N-LEAF-04
+    peer_interface: Ethernet1/1
+  - interface: Ethernet1/5
+    ip: "172.16.2.8"
+    prefix: 31
+    peer: N-LEAF-05
+    peer_interface: Ethernet1/1

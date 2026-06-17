@@ -1,0 +1,35 @@
+---
+# =============================================================================
+# F-SPINE-02 — IS-IS Underlay addressing (Phase 1)
+# Verified manually via CLI on 2026-06-17, codified here for module02.
+# =============================================================================
+
+loopback0_ip: "10.1.0.12"
+isis_net: "49.0001.0000.0000.0012.00"
+
+isis_links:
+  - interface: Ethernet1/1
+    ip: "172.16.1.10"
+    prefix: 31
+    peer: F-LEAF-01
+    peer_interface: Ethernet1/2
+  - interface: Ethernet1/2
+    ip: "172.16.1.12"
+    prefix: 31
+    peer: F-LEAF-02
+    peer_interface: Ethernet1/2
+  - interface: Ethernet1/3
+    ip: "172.16.1.14"
+    prefix: 31
+    peer: F-LEAF-03
+    peer_interface: Ethernet1/2
+  - interface: Ethernet1/4
+    ip: "172.16.1.16"
+    prefix: 31
+    peer: F-LEAF-04
+    peer_interface: Ethernet1/2
+  - interface: Ethernet1/5
+    ip: "172.16.1.18"
+    prefix: 31
+    peer: F-LEAF-05
+    peer_interface: Ethernet1/2

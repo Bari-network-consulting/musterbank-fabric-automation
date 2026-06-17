@@ -1,0 +1,10 @@
+---
+# =============================================================================
+# DC1 Frankfurt — IS-IS Underlay process settings (Phase 1)
+# Shared across all dc1_fabric devices (Spines + Leafs).
+# Per-device addressing (loopback, NET, link IPs) lives in host_vars/.
+# =============================================================================
+
+isis_process_tag: "UNDERLAY"
+isis_area: "49.0001"
+isis_level: "level-2"

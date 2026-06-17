@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# MusterBank AG — DC1 Frankfurt
+# module02_isis_underlay.yml
+#
+# Configures the IS-IS Level-2 underlay on all DC1 fabric devices
+# (F-SPINE-01/02, F-LEAF-01-05), replacing the OSPF underlay originally
+# planned in the HLD.
+#
+# Per device:
+#   - feature isis
+#   - Loopback0 with IS-IS enabled (passive — advertises /32 only)
+#   - router isis UNDERLAY — NET, is-type level-2
+#   - Each fabric-facing interface: IP address, ip router isis UNDERLAY,
+#     isis network point-to-point
+#
+# Excluded interfaces:
+#   - Mgmt0 (management — never part of the underlay)
+#   - vPC peer-links on leaf pairs (Ethernet1/5, Ethernet1/6 on
+#     F-LEAF-01-04) — these carry vPC peer-link traffic, not IS-IS
+#
+# Addressing (verified manually via CLI on 2026-06-17, see
+# host_vars/<hostname>.yml for the per-device loopback/NET/link table):
+#   Loopback0   : 10.1.0.x/32  (Spines .11/.12, Leafs match leaf number)
+#   P2P links   : 172.16.1.0/24 broken into /31s
+#   NET         : 49.0001.0000.0000.00XX.00
+#
+# Run: ansible-playbook dc1/module02_isis_underlay.yml -i dc1/inventory/hosts.ini
+# AWX: Job Template → MusterBank-DC1-ISIS-Underlay
+# =============================================================================
+
+- name: "DC1 Frankfurt — Configure IS-IS Underlay (Phase 1)"
+  hosts: dc1_fabric
+  gather_facts: false
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # STEP 1 — Enable the IS-IS feature
+    # -------------------------------------------------------------------------
+    - name: Enable feature isis
+      cisco.nxos.nxos_feature:
+        feature: isis
+        state: enabled
+
+    # -------------------------------------------------------------------------
+    # STEP 2 — Loopback0: IP address + IS-IS (passive interface)
+    # -------------------------------------------------------------------------
+    - name: Configure Loopback0 IP address
+      cisco.nxos.nxos_l3_interfaces:
+        config:
+          - name: loopback0
+            ipv4:
+              - address: "{{ loopback0_ip }}/32"
+        state: merged
+
+    - name: Ensure Loopback0 exists and is enabled
+      cisco.nxos.nxos_interfaces:
+        config:
+          - name: loopback0
+            enabled: true
+        state: merged
+
+    - name: Enable IS-IS on Loopback0
+      cisco.nxos.nxos_config:
+        lines:
+          - "ip router isis {{ isis_process_tag }}"
+        parents: "interface loopback0"
+
+    # -------------------------------------------------------------------------
+    # STEP 3 — router isis UNDERLAY: NET + level-2
+    # -------------------------------------------------------------------------
+    - name: Configure router isis process — NET and level
+      cisco.nxos.nxos_config:
+        lines:
+          - "net {{ isis_net }}"
+          - "is-type {{ isis_level }}"
+        parents: "router isis {{ isis_process_tag }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 4 — Fabric-facing interfaces: IP address + IS-IS point-to-point
+    # One task per link, driven by host_vars isis_links list.
+    # -------------------------------------------------------------------------
+    - name: Configure IP address on each IS-IS fabric interface
+      cisco.nxos.nxos_l3_interfaces:
+        config:
+          - name: "{{ item.interface }}"
+            ipv4:
+              - address: "{{ item.ip }}/{{ item.prefix }}"
+        state: merged
+      loop: "{{ isis_links }}"
+      loop_control:
+        label: "{{ item.interface }} -> {{ item.peer }} {{ item.peer_interface }}"
+
+    - name: Remove switchport mode on each IS-IS fabric interface
+      cisco.nxos.nxos_interfaces:
+        config:
+          - name: "{{ item.interface }}"
+            enabled: true
+            mode: layer3
+        state: merged
+      loop: "{{ isis_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
+
+    - name: Enable IS-IS + point-to-point network type on each fabric interface
+      cisco.nxos.nxos_config:
+        lines:
+          - "ip router isis {{ isis_process_tag }}"
+          - "isis network point-to-point"
+          - "no shutdown"
+        parents: "interface {{ item.interface }}"
+      loop: "{{ isis_links }}"
+      loop_control:
+        label: "{{ item.interface }} -> {{ item.peer }} {{ item.peer_interface }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 5 — Save configuration (EVE-NG persistence workaround, same
+    # pattern as module00/module01)
+    # -------------------------------------------------------------------------
+    - name: Save running-config to startup-config
+      cisco.nxos.nxos_command:
+        commands:
+          - command: "copy running-config startup-config"
+            prompt: "Copy complete"
+            answer: ""
+      register: save_result
+
+    - name: Confirm save succeeded
+      debug:
+        msg: "{{ inventory_hostname }}: IS-IS underlay configured and saved"
+      when: save_result is succeeded
+
+    # -------------------------------------------------------------------------
+    # STEP 6 — Verification (same commands used for manual CLI verification)
+    # -------------------------------------------------------------------------
+    - name: Verify IS-IS adjacencies
+      cisco.nxos.nxos_command:
+        commands:
+          - show isis adjacency
+      register: isis_adjacency
+
+    - name: Display IS-IS adjacency state
+      debug:
+        msg: "{{ inventory_hostname }} adjacencies:\n{{ isis_adjacency.stdout[0] }}"
+
+    - name: Verify IS-IS interface state
+      cisco.nxos.nxos_command:
+        commands:
+          - show isis interface brief
+      register: isis_interface_brief
+
+    - name: Display IS-IS interface brief
+      debug:
+        msg: "{{ inventory_hostname }} IS-IS interfaces:\n{{ isis_interface_brief.stdout[0] }}"
+
+    - name: Module summary
+      debug:
+        msg: >
+          {{ inventory_hostname }} — IS-IS UNDERLAY configured on Loopback0
+          ({{ loopback0_ip }}) and {{ isis_links | length }} fabric interface(s).
+          NET: {{ isis_net }}

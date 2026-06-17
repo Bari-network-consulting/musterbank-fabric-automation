@@ -5,10 +5,12 @@ ansible_user: admin
 ansible_password: Admin1234!
 ansible_become: false
 
+# BGP / OSPF (Phase 1 original HLD design — superseded by IS-IS below for underlay)
 bgp_as: 65001
 ospf_process: 1
 ospf_area: "0.0.0.0"
 
+# Tenants
 tenants:
   - name: TENANT-A
     vrf: TENANT-A
@@ -42,10 +44,20 @@ tenants:
 
 anycast_gw_mac: "0001.0001.0001"
 
+# Route reflectors (Spines)
 route_reflectors:
-  - ip: "10.1.0.1"
+  - ip: "10.1.0.11"
     description: "F-SPINE-01-RR"
-  - ip: "10.1.0.2"
+  - ip: "10.1.0.12"
     description: "F-SPINE-02-RR"
 
 nxos_image: "nxos64-cs.10.6.1.F.bin"
+
+# =============================================================================
+# IS-IS Underlay process settings (Phase 1)
+# Replaces the OSPF underlay originally planned above (ospf_process/ospf_area).
+# Per-device addressing (loopback, NET, link IPs) lives in host_vars/.
+# =============================================================================
+isis_process_tag: "UNDERLAY"
+isis_area: "49.0001"
+isis_level: "level-2"

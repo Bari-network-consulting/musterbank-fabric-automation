@@ -1,0 +1,174 @@
+---
+# =============================================================================
+# MusterBank AG — DC1 Frankfurt
+# module03_bgp_evpn.yml
+#
+# Configures MP-BGP EVPN peering on all DC1 fabric devices, using the
+# IS-IS underlay (module02) for loopback reachability between peers.
+#
+# Design (verified manually via CLI before this module was written):
+#   - iBGP, single AS 65001 (bgp_as, from dc1_fabric.yml)
+#   - Spines (dc1_spines) = Route Reflectors, peer with every leaf/border
+#     device, route-reflector-client + retain route-target all
+#   - Leafs (dc1_leaves + dc1_border) = RR clients, peer with both spines
+#   - Peering source: Loopback0 (update-source loopback0)
+#   - Address family: l2vpn evpn only (no ipv4 unicast needed for EVPN)
+#
+# Required features (confirmed empirically — feature bgp alone does NOT
+# expose the l2vpn evpn address-family; nv overlay evpn is required too):
+#   feature bgp
+#   nv overlay evpn
+#
+# Community handling: NX-OS expands "send-community both" into two
+# separate running-config lines, "send-community" and
+# "send-community extended". This module declares both lines explicitly
+# to match what actually persists on the device — declaring "both" as a
+# single line would cause Ansible to report changed=1 on every run, since
+# the running-config never actually contains that exact string.
+#
+# Neighbor derivation: neighbors are NOT stored in host_vars. They are
+# computed in this playbook from inventory group membership:
+#   - Spines peer with every host in dc1_leaves + dc1_border
+#   - Leafs/border peer with every host in dc1_spines
+# This means adding a 6th leaf or 3rd spine to the inventory is enough —
+# no host_vars edits needed for BGP EVPN peering to pick it up.
+#
+# Run: ansible-playbook dc1/module03_bgp_evpn.yml -i dc1/inventory/hosts.ini
+# AWX: Job Template → MusterBank-DC1-BGP-EVPN
+# =============================================================================
+
+- name: "DC1 Frankfurt — Configure MP-BGP EVPN Peering (Phase 2)"
+  hosts: dc1_fabric
+  gather_facts: false
+
+  vars:
+    # Combined leaf/border group — F-LEAF-05 lives in dc1_border, not
+    # dc1_leaves, so both groups must be combined to get "all leafs".
+    dc1_all_leafs: "{{ groups['dc1_leaves'] + groups['dc1_border'] }}"
+
+    # Each host computes its own EVPN neighbor list based on which
+    # inventory group it belongs to.
+    bgp_evpn_neighbors: >-
+      {{
+        (groups['dc1_spines'])
+        if inventory_hostname in dc1_all_leafs
+        else dc1_all_leafs
+      }}
+
+    # Spines act as route reflectors for their leaf/border neighbors.
+    is_route_reflector: "{{ inventory_hostname in groups['dc1_spines'] }}"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # STEP 1 — Enable required features
+    # -------------------------------------------------------------------------
+    - name: Enable feature bgp
+      cisco.nxos.nxos_feature:
+        feature: bgp
+        state: enabled
+
+    - name: Enable nv overlay evpn
+      cisco.nxos.nxos_config:
+        lines:
+          - "nv overlay evpn"
+
+    # -------------------------------------------------------------------------
+    # STEP 2 — router bgp <AS>: router-id
+    # -------------------------------------------------------------------------
+    - name: Configure router bgp — router-id
+      cisco.nxos.nxos_config:
+        lines:
+          - "router-id {{ loopback0_ip }}"
+        parents: "router bgp {{ bgp_as }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 3 — Route reflectors only: retain route-target all
+    # -------------------------------------------------------------------------
+    - name: "Spines only — configure retain route-target all"
+      cisco.nxos.nxos_config:
+        lines:
+          - "retain route-target all"
+        parents:
+          - "router bgp {{ bgp_as }}"
+          - "address-family l2vpn evpn"
+      when: is_route_reflector
+
+    # -------------------------------------------------------------------------
+    # STEP 4 — Per-neighbor configuration (one task per neighbor in the
+    # computed bgp_evpn_neighbors list)
+    # -------------------------------------------------------------------------
+    - name: Configure BGP neighbor — remote-as and update-source
+      cisco.nxos.nxos_config:
+        lines:
+          - "remote-as {{ bgp_as }}"
+          - "update-source loopback0"
+        parents:
+          - "router bgp {{ bgp_as }}"
+          - "neighbor {{ hostvars[item].loopback0_ip }}"
+      loop: "{{ bgp_evpn_neighbors }}"
+      loop_control:
+        label: "neighbor {{ hostvars[item].loopback0_ip }} ({{ item }})"
+
+    - name: Configure BGP neighbor — l2vpn evpn address-family (send-community)
+      cisco.nxos.nxos_config:
+        lines:
+          - "send-community"
+          - "send-community extended"
+        parents:
+          - "router bgp {{ bgp_as }}"
+          - "neighbor {{ hostvars[item].loopback0_ip }}"
+          - "address-family l2vpn evpn"
+      loop: "{{ bgp_evpn_neighbors }}"
+      loop_control:
+        label: "neighbor {{ hostvars[item].loopback0_ip }} ({{ item }})"
+
+    - name: "Spines only — set route-reflector-client per neighbor"
+      cisco.nxos.nxos_config:
+        lines:
+          - "route-reflector-client"
+        parents:
+          - "router bgp {{ bgp_as }}"
+          - "neighbor {{ hostvars[item].loopback0_ip }}"
+          - "address-family l2vpn evpn"
+      loop: "{{ bgp_evpn_neighbors }}"
+      loop_control:
+        label: "neighbor {{ hostvars[item].loopback0_ip }} ({{ item }})"
+      when: is_route_reflector
+
+    # -------------------------------------------------------------------------
+    # STEP 5 — Save configuration (EVE-NG persistence workaround)
+    # -------------------------------------------------------------------------
+    - name: Save running-config to startup-config
+      cisco.nxos.nxos_command:
+        commands:
+          - command: "copy running-config startup-config"
+            prompt: "Copy complete"
+            answer: ""
+      register: save_result
+
+    - name: Confirm save succeeded
+      debug:
+        msg: "{{ inventory_hostname }}: BGP EVPN peering configured and saved"
+      when: save_result is succeeded
+
+    # -------------------------------------------------------------------------
+    # STEP 6 — Verification
+    # -------------------------------------------------------------------------
+    - name: Verify BGP L2VPN EVPN summary
+      cisco.nxos.nxos_command:
+        commands:
+          - show bgp l2vpn evpn summary
+      register: bgp_evpn_summary
+
+    - name: Display BGP L2VPN EVPN summary
+      debug:
+        msg: "{{ inventory_hostname }} BGP EVPN summary:\n{{ bgp_evpn_summary.stdout[0] }}"
+
+    - name: Module summary
+      debug:
+        msg: >
+          {{ inventory_hostname }} — BGP EVPN configured as
+          {{ 'Route Reflector' if is_route_reflector else 'RR Client' }}
+          with {{ bgp_evpn_neighbors | length }} neighbor(s):
+          {{ bgp_evpn_neighbors | join(', ') }}

@@ -1,0 +1,244 @@
+---
+# =============================================================================
+# MusterBank AG — DC1 Frankfurt
+# module05_vpc_host_ports.yml
+#
+# Configures vPC (peer-keepalive, peer-link, domain) and host-facing
+# ports (vPC port-channels for dual-homed servers, plain access ports
+# for single-homed servers) on DC1 leafs.
+#
+# Design (verified manually via CLI before this module was written,
+# including real failures debugged and fixed on hardware):
+#   - vPC domain 1: F-LEAF-01 (primary) / F-LEAF-02 (secondary)
+#   - vPC domain 2: F-LEAF-03 (primary) / F-LEAF-04 (secondary)
+#   - F-LEAF-05 is standalone (no vPC) — vpc is null in its host_vars,
+#     so this playbook simply has nothing to do there for vPC tasks.
+#   - Peer-link: Ethernet1/5 + Ethernet1/6, port-channel 1, trunk
+#     carrying all 4 tenant VLANs (10,20,30,40) — not just the VLAN(s)
+#     a given vPC pair's hosts actually use, since the peer-link must
+#     be able to carry any VLAN for orphan-port forwarding scenarios.
+#   - Peer-keepalive: dedicated routed link, Ethernet1/8, in a small
+#     /30 per pair, explicit "vrf default" required.
+#   - SRV1/SRV3 are dual-homed via LACP to their respective vPC pair;
+#     SRV2 is single-homed (plain access port, no port-channel).
+#
+# Two issues were diagnosed and fixed manually on hardware before this
+# module was written; both fixes are codified here as the only-known-
+# good config, not left for Ansible to "discover":
+#
+#   1. peer-keepalive VRF: NX-OS defaults peer-keepalive lookups to the
+#      "management" VRF even when the keepalive IP itself was configured
+#      in the default VRF. Without an explicit "vrf default" on the
+#      peer-keepalive line, vPC reports
+#      "vPC keep-alive status: Suspended (Destination IP not reachable)"
+#      even though the underlying IP is perfectly pingable. Fixed by
+#      always declaring vrf default explicitly (this module does so
+#      unconditionally — see Step 2).
+#
+#   2. vPC + NVE secondary IP: when vPC and VXLAN/NVE coexist on the
+#      same leaf pair, NX-OS's vPC consistency-check engine requires a
+#      SHARED secondary IP address on the NVE source-interface loopback
+#      (loopback0), identical on both vPC peers, in addition to each
+#      peer's own unique primary loopback IP. Without it, vPC reports
+#      "Configuration inconsistency reason: Secondary IP address does
+#      not match" and suspends the vPC member ports entirely — even
+#      though the peer-link and peer-keepalive are both healthy. Fixed
+#      by configuring loopback0 with a shared "secondary" IP per vPC
+#      pair (nve_secondary_ip in host_vars) — see Step 3.
+#
+# Data model: vPC/port data is per-device (not derivable from group
+# membership the way BGP EVPN neighbors were), so it lives in
+# host_vars as a `vpc` dict (null on non-vPC leafs like F-LEAF-05),
+# plus `vpc_host_ports` and `access_ports` lists.
+#
+# Run: ansible-playbook dc1/module05_vpc_host_ports.yml -i dc1/inventory/hosts.ini
+# AWX: Job Template → MusterBank-DC1-vPC-Host-Ports
+# =============================================================================
+
+- name: "DC1 Frankfurt — Configure vPC and Host Access Ports (Phase 3)"
+  hosts: dc1_leaves:dc1_border
+  gather_facts: false
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # STEP 1 — Features (only needed where vPC is actually configured)
+    # -------------------------------------------------------------------------
+    - name: Enable feature vpc
+      cisco.nxos.nxos_feature:
+        feature: vpc
+        state: enabled
+      when: vpc is not none
+
+    - name: Enable feature lacp
+      cisco.nxos.nxos_feature:
+        feature: lacp
+        state: enabled
+      when: (vpc is not none) or (vpc_host_ports | length > 0)
+
+    # -------------------------------------------------------------------------
+    # STEP 2 — Peer-keepalive link + vPC domain
+    # vrf default is ALWAYS explicit here — see header notes on why.
+    # NVE secondary IP on loopback0 is shared across the vPC pair — see
+    # header notes on why this is required when vPC + VXLAN coexist.
+    # -------------------------------------------------------------------------
+    - name: "vPC leafs only — configure peer-keepalive interface"
+      cisco.nxos.nxos_l3_interfaces:
+        config:
+          - name: "{{ vpc.peer_keepalive_interface }}"
+            ipv4:
+              - address: "{{ vpc.peer_keepalive_source }}/30"
+        state: merged
+      when: vpc is not none
+
+    - name: "vPC leafs only — enable peer-keepalive interface, remove switchport"
+      cisco.nxos.nxos_interfaces:
+        config:
+          - name: "{{ vpc.peer_keepalive_interface }}"
+            enabled: true
+            mode: layer3
+        state: merged
+      when: vpc is not none
+
+    - name: "vPC leafs only — configure vPC domain"
+      cisco.nxos.nxos_config:
+        lines:
+          - "peer-keepalive destination {{ vpc.peer_keepalive_dest }} source {{ vpc.peer_keepalive_source }} vrf default"
+          - "peer-switch"
+          - "peer-gateway"
+          - "ip arp synchronize"
+        parents: "vpc domain {{ vpc.domain }}"
+      when: vpc is not none
+
+    - name: "vPC leafs only — configure shared NVE secondary IP on loopback0"
+      cisco.nxos.nxos_config:
+        lines:
+          - "ip address {{ vpc.nve_secondary_ip }}/32 secondary"
+        parents: "interface loopback0"
+      when: vpc is not none
+
+    # -------------------------------------------------------------------------
+    # STEP 3 — Peer-link (port-channel 1, trunk, all 4 tenant VLANs)
+    # -------------------------------------------------------------------------
+    - name: "vPC leafs only — configure peer-link port-channel interface"
+      cisco.nxos.nxos_config:
+        lines:
+          - "switchport"
+          - "switchport mode trunk"
+          - "switchport trunk allowed vlan 10,20,30,40"
+          - "spanning-tree port type network"
+          - "vpc peer-link"
+        parents: "interface port-channel1"
+      when: vpc is not none
+
+    - name: "vPC leafs only — configure peer-link member interfaces"
+      cisco.nxos.nxos_config:
+        lines:
+          - "switchport"
+          - "switchport mode trunk"
+          - "switchport trunk allowed vlan 10,20,30,40"
+          - "channel-group 1 mode active"
+          - "no shutdown"
+        parents: "interface {{ item }}"
+      loop: "{{ vpc.peer_link_interfaces }}"
+      loop_control:
+        label: "{{ item }} -> port-channel1 (peer-link)"
+      when: vpc is not none
+
+    # -------------------------------------------------------------------------
+    # STEP 4 — Host-facing vPC port-channels (dual-homed servers)
+    # -------------------------------------------------------------------------
+    - name: "Configure vPC host port-channel interface"
+      cisco.nxos.nxos_config:
+        lines:
+          - "switchport"
+          - "switchport mode access"
+          - "switchport access vlan {{ item.vlan }}"
+          - "spanning-tree port type edge"
+          - "vpc {{ item.vpc_id }}"
+        parents: "interface port-channel{{ item.port_channel }}"
+      loop: "{{ vpc_host_ports }}"
+      loop_control:
+        label: "Po{{ item.port_channel }} (vpc {{ item.vpc_id }}) - {{ item.description }}"
+
+    - name: "Configure vPC host port-channel member interface"
+      cisco.nxos.nxos_config:
+        lines:
+          - "switchport"
+          - "switchport mode access"
+          - "switchport access vlan {{ item.vlan }}"
+          - "channel-group {{ item.port_channel }} mode active"
+          - "no shutdown"
+        parents: "interface {{ item.member_interface }}"
+      loop: "{{ vpc_host_ports }}"
+      loop_control:
+        label: "{{ item.member_interface }} -> Po{{ item.port_channel }} - {{ item.description }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 5 — Single-homed access ports (no vPC, no port-channel)
+    # -------------------------------------------------------------------------
+    - name: "Configure single-homed access port"
+      cisco.nxos.nxos_config:
+        lines:
+          - "switchport"
+          - "switchport mode access"
+          - "switchport access vlan {{ item.vlan }}"
+          - "spanning-tree port type edge"
+          - "no shutdown"
+        parents: "interface {{ item.interface }}"
+      loop: "{{ access_ports }}"
+      loop_control:
+        label: "{{ item.interface }} (VLAN {{ item.vlan }}) - {{ item.description }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 6 — Save configuration (EVE-NG persistence workaround)
+    # -------------------------------------------------------------------------
+    - name: Save running-config to startup-config
+      cisco.nxos.nxos_command:
+        commands:
+          - command: "copy running-config startup-config"
+            prompt: "Copy complete"
+            answer: ""
+      register: save_result
+
+    - name: Confirm save succeeded
+      debug:
+        msg: "{{ inventory_hostname }}: vPC and host access ports configured and saved"
+      when: save_result is succeeded
+
+    # -------------------------------------------------------------------------
+    # STEP 7 — Verification
+    # -------------------------------------------------------------------------
+    - name: "vPC leafs only — verify vPC brief"
+      cisco.nxos.nxos_command:
+        commands:
+          - show vpc brief
+      register: vpc_brief
+      when: vpc is not none
+
+    - name: "vPC leafs only — display vPC brief"
+      debug:
+        msg: "{{ inventory_hostname }} vPC brief:\n{{ vpc_brief.stdout[0] }}"
+      when: vpc is not none
+
+    - name: Verify port-channel summary
+      cisco.nxos.nxos_command:
+        commands:
+          - show port-channel summary
+      register: pc_summary
+      when: (vpc is not none) or (vpc_host_ports | length > 0)
+
+    - name: Display port-channel summary
+      debug:
+        msg: "{{ inventory_hostname }} port-channel summary:\n{{ pc_summary.stdout[0] }}"
+      when: (vpc is not none) or (vpc_host_ports | length > 0)
+
+    - name: Module summary
+      vars:
+        vpc_desc: >-
+          {{ 'vPC domain ' + (vpc.domain | string) + ' (' + vpc.role + ')' if vpc is not none else 'standalone (no vPC)' }}
+      debug:
+        msg: >
+          {{ inventory_hostname }} — {{ vpc_desc }},
+          {{ vpc_host_ports | length }} dual-homed host port-channel(s),
+          {{ access_ports | length }} single-homed access port(s).

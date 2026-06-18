@@ -18,3 +18,44 @@ isis_links:
     prefix: 31
     peer: F-SPINE-02
     peer_interface: Ethernet1/2
+
+# =============================================================================
+# vPC (Phase 3 — verified manually via CLI on 2026-06-18, codified for
+# module05). F-LEAF-01/F-LEAF-02 form vPC domain 1.
+#
+# IMPORTANT: nve_secondary_ip must be IDENTICAL on both peers in a vPC
+# pair (it's a shared, not per-device, address). Without it, NX-OS's vPC
+# consistency check fails with "Secondary IP address does not match" and
+# suspends the vPC member ports — confirmed empirically during this
+# build. See module05 comments for details.
+# =============================================================================
+
+vpc:
+  domain: 1
+  role: secondary
+  peer_keepalive_source: "10.255.1.2"
+  peer_keepalive_dest: "10.255.1.1"
+  peer_keepalive_interface: Ethernet1/8
+  peer_link_interfaces:
+    - Ethernet1/5
+    - Ethernet1/6
+  nve_secondary_ip: "10.1.100.1"
+
+# Host-facing vPC port-channels on this leaf (dual-homed servers)
+vpc_host_ports:
+  - vpc_id: 10
+    port_channel: 10
+    vlan: 10
+    member_interface: Ethernet1/3
+    description: "SRV1 (dual-homed via vPC 10)"
+  - vpc_id: 11
+    port_channel: 11
+    vlan: 30
+    member_interface: Ethernet1/4
+    description: "SRV11 (dual-homed via vPC 11)"
+
+# Single-homed access ports on this leaf (no vPC, no port-channel)
+access_ports:
+  - interface: Ethernet1/7
+    vlan: 20
+    description: "SRV2 (single-homed)"

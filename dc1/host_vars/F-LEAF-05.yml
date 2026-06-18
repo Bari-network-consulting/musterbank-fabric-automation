@@ -18,3 +18,14 @@ isis_links:
     prefix: 31
     peer: F-SPINE-02
     peer_interface: Ethernet1/5
+
+# =============================================================================
+# vPC (Phase 3) — F-LEAF-05 is NOT part of any vPC pair (standalone border
+# leaf). vpc is explicitly null and the port lists explicitly empty so
+# module05 can run uniformly across dc1_leaves:dc1_border without needing
+# default() filters scattered through the playbook.
+# =============================================================================
+
+vpc: null
+vpc_host_ports: []
+access_ports: []

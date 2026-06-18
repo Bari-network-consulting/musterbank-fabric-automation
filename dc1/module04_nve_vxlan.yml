@@ -1,0 +1,239 @@
+---
+# =============================================================================
+# MusterBank AG — DC1 Frankfurt
+# module04_nve_vxlan.yml
+#
+# Configures the NVE/VXLAN data plane on all DC1 leafs (F-LEAF-01-05),
+# building on the IS-IS underlay (module02) and BGP EVPN control plane
+# (module03). Spines are NOT VTEPs in this design — leafs only.
+#
+# Design (verified manually via CLI before this module was written):
+#   - BUM handling: ingress replication (BGP-based dynamic VTEP discovery,
+#     no multicast/PIM required) — chosen as the closest standalone-NXOS
+#     parallel to how Cisco ACI Multi-Site handles BUM at its inter-site
+#     boundary.
+#   - Both TENANT-A and TENANT-B (all 4 tenant VLANs) are configured on
+#     EVERY leaf, not restricted to specific leaf pairs — any leaf can
+#     host either tenant's workloads.
+#   - Per tenant: a VRF with an associated L3VNI (for inter-VLAN routing),
+#     two tenant VLANs each mapped to an L2VNI, anycast gateway SVIs,
+#     and an L3VNI SVI (no IP, ip forward only) tying VRF routing to the
+#     L3VNI.
+#
+# Required features (confirmed empirically on hardware):
+#   feature vn-segment-vlan-based
+#   feature interface-vlan
+#   feature fabric forwarding
+#   feature nv overlay        <- separate from "nv overlay evpn" (module03);
+#                                 feature nv overlay is required to even
+#                                 create an nve interface at all.
+#
+# Tenant/VLAN/VNI data is read from the existing `tenants` list in
+# dc1_fabric.yml (group_vars) — not duplicated here. anycast_gw_mac is
+# also already defined there.
+#
+# Run: ansible-playbook dc1/module04_nve_vxlan.yml -i dc1/inventory/hosts.ini
+# AWX: Job Template → MusterBank-DC1-NVE-VXLAN
+# =============================================================================
+
+- name: "DC1 Frankfurt — Configure NVE/VXLAN Data Plane (Phase 3)"
+  hosts: dc1_leaves:dc1_border
+  gather_facts: false
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # STEP 1 — Enable required features + global anycast gateway MAC
+    # -------------------------------------------------------------------------
+    - name: Enable feature vn-segment-vlan-based
+      cisco.nxos.nxos_feature:
+        feature: vn-segment-vlan-based
+        state: enabled
+
+    - name: Enable feature interface-vlan
+      cisco.nxos.nxos_feature:
+        feature: interface-vlan
+        state: enabled
+
+    - name: Enable feature fabric forwarding
+      cisco.nxos.nxos_feature:
+        feature: fabric forwarding
+        state: enabled
+
+    - name: Enable feature nv overlay
+      cisco.nxos.nxos_config:
+        lines:
+          - "feature nv overlay"
+
+    - name: Configure global anycast gateway MAC
+      cisco.nxos.nxos_config:
+        lines:
+          - "fabric forwarding anycast-gateway-mac {{ anycast_gw_mac }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 2 — VRF context per tenant: vni, rd auto, route-targets
+    # -------------------------------------------------------------------------
+    - name: Configure tenant VRF — vni and rd
+      cisco.nxos.nxos_config:
+        lines:
+          - "vni {{ item.l3vni }}"
+          - "rd auto"
+        parents: "vrf context {{ item.vrf }}"
+      loop: "{{ tenants }}"
+      loop_control:
+        label: "{{ item.vrf }} (L3VNI {{ item.l3vni }})"
+
+    - name: Configure tenant VRF — route-targets (ipv4 unicast AF)
+      cisco.nxos.nxos_config:
+        lines:
+          - "route-target both auto"
+          - "route-target both auto evpn"
+        parents:
+          - "vrf context {{ item.vrf }}"
+          - "address-family ipv4 unicast"
+      loop: "{{ tenants }}"
+      loop_control:
+        label: "{{ item.vrf }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 3 — VLAN to VNI mapping
+    #   - Tenant-facing VLANs -> L2VNI (one task per VLAN, nested loop)
+    #   - L3VNI VLAN -> L3VNI (one task per tenant)
+    # -------------------------------------------------------------------------
+    - name: Configure tenant VLAN — vn-segment (L2VNI)
+      cisco.nxos.nxos_config:
+        lines:
+          - "vn-segment {{ item.1.l2vni }}"
+        parents: "vlan {{ item.1.id }}"
+      loop: "{{ tenants | subelements('vlans') }}"
+      loop_control:
+        label: "VLAN {{ item.1.id }} ({{ item.0.vrf }}) -> L2VNI {{ item.1.l2vni }}"
+
+    - name: Configure L3VNI VLAN — vn-segment (L3VNI)
+      cisco.nxos.nxos_config:
+        lines:
+          - "vn-segment {{ item.l3vni }}"
+        parents: "vlan {{ item.l3vni_vlan }}"
+      loop: "{{ tenants }}"
+      loop_control:
+        label: "VLAN {{ item.l3vni_vlan }} ({{ item.vrf }}) -> L3VNI {{ item.l3vni }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 4 — Tenant SVIs with anycast gateway
+    # -------------------------------------------------------------------------
+    - name: Configure tenant SVI — vrf member, anycast gateway IP
+      cisco.nxos.nxos_config:
+        lines:
+          - "no shutdown"
+          - "vrf member {{ item.0.vrf }}"
+          - "ip address {{ item.1.anycast_gw }}"
+          - "fabric forwarding mode anycast-gateway"
+          - "no ip redirects"
+        parents: "interface Vlan{{ item.1.id }}"
+      loop: "{{ tenants | subelements('vlans') }}"
+      loop_control:
+        label: "Vlan{{ item.1.id }} ({{ item.0.vrf }}) -> {{ item.1.anycast_gw }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 5 — L3VNI SVIs (no IP — ties VRF routing to the L3VNI)
+    # -------------------------------------------------------------------------
+    - name: Configure L3VNI SVI — vrf member, ip forward
+      cisco.nxos.nxos_config:
+        lines:
+          - "no shutdown"
+          - "vrf member {{ item.vrf }}"
+          - "ip forward"
+          - "no ip redirects"
+        parents: "interface Vlan{{ item.l3vni_vlan }}"
+      loop: "{{ tenants }}"
+      loop_control:
+        label: "Vlan{{ item.l3vni_vlan }} ({{ item.vrf }} L3VNI SVI)"
+
+    # -------------------------------------------------------------------------
+    # STEP 6 — interface nve1 (the VTEP itself)
+    # -------------------------------------------------------------------------
+    - name: Configure nve1 — source-interface and host-reachability
+      cisco.nxos.nxos_config:
+        lines:
+          - "no shutdown"
+          - "source-interface loopback0"
+          - "host-reachability protocol bgp"
+        parents: "interface nve1"
+
+    - name: "Configure nve1 — L2VNI member with ingress-replication"
+      cisco.nxos.nxos_config:
+        lines:
+          - "ingress-replication protocol bgp"
+        parents:
+          - "interface nve1"
+          - "member vni {{ item.1.l2vni }}"
+      loop: "{{ tenants | subelements('vlans') }}"
+      loop_control:
+        label: "L2VNI {{ item.1.l2vni }} ({{ item.0.vrf }} / VLAN {{ item.1.id }})"
+
+    - name: "Configure nve1 — L3VNI member (associate-vrf)"
+      cisco.nxos.nxos_config:
+        lines:
+          - "member vni {{ item.l3vni }} associate-vrf"
+        parents: "interface nve1"
+      loop: "{{ tenants }}"
+      loop_control:
+        label: "L3VNI {{ item.l3vni }} ({{ item.vrf }})"
+
+    # -------------------------------------------------------------------------
+    # STEP 7 — Save configuration (EVE-NG persistence workaround)
+    # -------------------------------------------------------------------------
+    - name: Save running-config to startup-config
+      cisco.nxos.nxos_command:
+        commands:
+          - command: "copy running-config startup-config"
+            prompt: "Copy complete"
+            answer: ""
+      register: save_result
+
+    - name: Confirm save succeeded
+      debug:
+        msg: "{{ inventory_hostname }}: NVE/VXLAN data plane configured and saved"
+      when: save_result is succeeded
+
+    # -------------------------------------------------------------------------
+    # STEP 8 — Verification
+    # -------------------------------------------------------------------------
+    - name: Verify nve1 interface state
+      cisco.nxos.nxos_command:
+        commands:
+          - show nve interface nve1
+      register: nve_interface
+
+    - name: Display nve1 interface state
+      debug:
+        msg: "{{ inventory_hostname }} nve1:\n{{ nve_interface.stdout[0] }}"
+
+    - name: Verify nve1 VNI state
+      cisco.nxos.nxos_command:
+        commands:
+          - show nve vni
+      register: nve_vni
+
+    - name: Display nve1 VNI state
+      debug:
+        msg: "{{ inventory_hostname }} VNIs:\n{{ nve_vni.stdout[0] }}"
+
+    - name: Verify nve1 peers
+      cisco.nxos.nxos_command:
+        commands:
+          - show nve peers
+      register: nve_peers
+
+    - name: Display nve1 peers
+      debug:
+        msg: "{{ inventory_hostname }} NVE peers:\n{{ nve_peers.stdout[0] }}"
+
+    - name: Module summary
+      vars:
+        total_l2vnis: "{{ tenants | map(attribute='vlans') | map('length') | sum }}"
+      debug:
+        msg: >
+          {{ inventory_hostname }} — NVE/VXLAN configured with
+          {{ tenants | length }} tenant(s), {{ total_l2vnis }} L2VNI(s),
+          and {{ tenants | length }} L3VNI(s) on interface nve1.

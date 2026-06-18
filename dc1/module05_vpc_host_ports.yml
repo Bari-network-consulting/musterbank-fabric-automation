@@ -46,6 +46,65 @@
 #      by configuring loopback0 with a shared "secondary" IP per vPC
 #      pair (nve_secondary_ip in host_vars) — see Step 3.
 #
+#   3. Bare "switchport" line breaks idempotency: NX-OS only accepts a
+#      standalone "switchport" command as a Layer-3 -> Layer-2 MODE
+#      CONVERSION. Once an interface is already a switchport (e.g. on
+#      any re-run after the first), NX-OS rejects a redundant bare
+#      "switchport" line with "% Incomplete command" — it is not a
+#      harmless no-op the way "switchport mode trunk" or "switchport
+#      mode access" are. Fixed by never declaring a bare "switchport"
+#      line; "switchport mode trunk/access" alone is sufficient and is
+#      genuinely idempotent on every run.
+#
+#   4. Switchport config on an already-bundled physical member port:
+#      once a physical interface is an active member of a port-channel
+#      (channel-group already applied), NX-OS rejects switchport
+#      mode/VLAN commands issued directly on that physical interface
+#      with "% Invalid command" — switchport/VLAN config belongs on the
+#      port-channel logical interface, not duplicated on its bundled
+#      physical members. Fixed by only declaring channel-group and
+#      admin state (no shutdown) on physical member interfaces; all
+#      switchport mode/VLAN config lives exclusively on the
+#      port-channel interface tasks (Step 3 / Step 4 above).
+#
+#   5. L2-to-L3 conversion ordering on the peer-keepalive interface: a
+#      factory-default NX-OS Ethernet interface is ALREADY a Layer-2
+#      switchport (access mode, VLAN 1) — there is no implicit
+#      conversion to Layer-3 when an IPv4 address is assigned via
+#      nxos_l3_interfaces. Assigning an IP to a still-Layer-2 interface
+#      fails with "% Invalid command". This bug was masked during
+#      initial development because the peer-keepalive interfaces had
+#      already been manually converted to Layer-3 in an earlier
+#      session, before module05 ever ran against them — it only
+#      surfaced when tested against a genuinely fresh/default
+#      interface. Fixed by always running the Layer-3 mode conversion
+#      (nxos_interfaces, mode: layer3) BEFORE the IP address assignment
+#      (nxos_l3_interfaces), never after.
+#
+#   6. Switchport mode vs. channel-group bind ordering — a genuine
+#      either/or, not a simple ordering fix:
+#        - On a FRESH interface (not yet bundled), NX-OS requires the
+#          interface's switchport mode to already match the
+#          port-channel's mode BEFORE channel-group will accept the
+#          bind, or it fails with "Command failed: Port not
+#          compatible — Port mode: Port-channel mode and interface
+#          mode do not match".
+#        - On an ALREADY-BUNDLED interface, NX-OS rejects ANY
+#          switchport command on that physical interface outright
+#          (even just "switchport mode ?") with "% Invalid command" —
+#          switchport config must go on the port-channel, never
+#          re-declared on a bundled member (see fix #4 above).
+#      These two requirements are mutually exclusive for any single
+#      unconditional task, so this module checks current state first
+#      (show running-config interface <x> | include channel-group) and
+#      only sets switchport mode on interfaces NOT YET bundled, before
+#      the channel-group bind task runs unconditionally on all of them.
+#      This was only discovered by testing module05 against a
+#      genuinely fresh/default interface — it never surfaced when
+#      re-running against already-configured hardware, since by then
+#      every member interface had already (by luck of manual config
+#      history) ended up with switchport mode pre-set.
+#
 # Data model: vPC/port data is per-device (not derivable from group
 # membership the way BGP EVPN neighbors were), so it lives in
 # host_vars as a `vpc` dict (null on non-vPC leafs like F-LEAF-05),
@@ -82,21 +141,21 @@
     # NVE secondary IP on loopback0 is shared across the vPC pair — see
     # header notes on why this is required when vPC + VXLAN coexist.
     # -------------------------------------------------------------------------
-    - name: "vPC leafs only — configure peer-keepalive interface"
-      cisco.nxos.nxos_l3_interfaces:
-        config:
-          - name: "{{ vpc.peer_keepalive_interface }}"
-            ipv4:
-              - address: "{{ vpc.peer_keepalive_source }}/30"
-        state: merged
-      when: vpc is not none
-
-    - name: "vPC leafs only — enable peer-keepalive interface, remove switchport"
+    - name: "vPC leafs only — convert peer-keepalive interface to layer3, enable"
       cisco.nxos.nxos_interfaces:
         config:
           - name: "{{ vpc.peer_keepalive_interface }}"
             enabled: true
             mode: layer3
+        state: merged
+      when: vpc is not none
+
+    - name: "vPC leafs only — configure peer-keepalive interface IP address"
+      cisco.nxos.nxos_l3_interfaces:
+        config:
+          - name: "{{ vpc.peer_keepalive_interface }}"
+            ipv4:
+              - address: "{{ vpc.peer_keepalive_source }}/30"
         state: merged
       when: vpc is not none
 
@@ -123,7 +182,6 @@
     - name: "vPC leafs only — configure peer-link port-channel interface"
       cisco.nxos.nxos_config:
         lines:
-          - "switchport"
           - "switchport mode trunk"
           - "switchport trunk allowed vlan 10,20,30,40"
           - "spanning-tree port type network"
@@ -131,12 +189,32 @@
         parents: "interface port-channel1"
       when: vpc is not none
 
-    - name: "vPC leafs only — configure peer-link member interfaces"
+    - name: "vPC leafs only — check current channel-group membership of peer-link interfaces"
+      cisco.nxos.nxos_command:
+        commands:
+          - "show running-config interface {{ item }} | include channel-group"
+      loop: "{{ vpc.peer_link_interfaces }}"
+      loop_control:
+        label: "{{ item }}"
+      register: peer_link_membership_check
+      when: vpc is not none
+
+    - name: "vPC leafs only — set switchport mode on peer-link members NOT YET bundled"
       cisco.nxos.nxos_config:
         lines:
-          - "switchport"
           - "switchport mode trunk"
           - "switchport trunk allowed vlan 10,20,30,40"
+        parents: "interface {{ item.item }}"
+      loop: "{{ peer_link_membership_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - vpc is not none
+        - "(item.stdout[0] | default('')) | trim == ''"
+
+    - name: "vPC leafs only — bind peer-link members to channel-group"
+      cisco.nxos.nxos_config:
+        lines:
           - "channel-group 1 mode active"
           - "no shutdown"
         parents: "interface {{ item }}"
@@ -151,7 +229,6 @@
     - name: "Configure vPC host port-channel interface"
       cisco.nxos.nxos_config:
         lines:
-          - "switchport"
           - "switchport mode access"
           - "switchport access vlan {{ item.vlan }}"
           - "spanning-tree port type edge"
@@ -161,12 +238,29 @@
       loop_control:
         label: "Po{{ item.port_channel }} (vpc {{ item.vpc_id }}) - {{ item.description }}"
 
-    - name: "Configure vPC host port-channel member interface"
+    - name: "Check current channel-group membership of vPC host member interfaces"
+      cisco.nxos.nxos_command:
+        commands:
+          - "show running-config interface {{ item.member_interface }} | include channel-group"
+      loop: "{{ vpc_host_ports }}"
+      loop_control:
+        label: "{{ item.member_interface }}"
+      register: host_member_membership_check
+
+    - name: "Set switchport mode on vPC host members NOT YET bundled"
       cisco.nxos.nxos_config:
         lines:
-          - "switchport"
           - "switchport mode access"
-          - "switchport access vlan {{ item.vlan }}"
+          - "switchport access vlan {{ item.item.vlan }}"
+        parents: "interface {{ item.item.member_interface }}"
+      loop: "{{ host_member_membership_check.results }}"
+      loop_control:
+        label: "{{ item.item.member_interface }}"
+      when: "(item.stdout[0] | default('')) | trim == ''"
+
+    - name: "Bind vPC host members to channel-group"
+      cisco.nxos.nxos_config:
+        lines:
           - "channel-group {{ item.port_channel }} mode active"
           - "no shutdown"
         parents: "interface {{ item.member_interface }}"
@@ -180,7 +274,6 @@
     - name: "Configure single-homed access port"
       cisco.nxos.nxos_config:
         lines:
-          - "switchport"
           - "switchport mode access"
           - "switchport access vlan {{ item.vlan }}"
           - "spanning-tree port type edge"

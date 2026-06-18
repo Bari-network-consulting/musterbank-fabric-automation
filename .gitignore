@@ -5,4 +5,5 @@ __pycache__/
 *.log
 *.tmp
 /tmp/
-collections/
+collections/*
+!collections/requirements.yml

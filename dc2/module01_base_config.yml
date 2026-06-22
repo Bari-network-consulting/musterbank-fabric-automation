@@ -32,6 +32,7 @@
         state: merged
 
     - name: Set boot image
+      ignore_errors: yes
       cisco.nxos.nxos_command:
         commands:
           - "boot nxos bootflash:/{{ nxos_image }}"
